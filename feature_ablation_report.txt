@@ -1,0 +1,121 @@
+BÁO CÁO THỬ NGHIỆM FEATURE ENGINEERING (ABLATION STUDY)
+Bài toán: Phát hiện gian lận thẻ tín dụng (Kaggle Playground Series S6E11 - Predicting Credit Card Fraud)
+Metric đánh giá: ROC-AUC
+Tập dữ liệu: data/train.csv (699.960 dòng, 24 đặc trưng gốc + id + is_fraud)
+
+================================================================================
+1. THIẾT LẬP THÍ NGHIỆM ĐỐI CHỨNG (ABLATION SETUP)
+================================================================================
+- Mô hình dùng để đo: XGBClassifier
+  + n_estimators=2000, learning_rate=0.05, max_depth=6, min_child_weight=10
+  + subsample=0.8, colsample_bytree=0.8, reg_alpha=1.0, reg_lambda=5.0
+  + tree_method="hist", enable_categorical=True, eval_metric="auc", early_stopping_rounds=50
+  + random_state=42
+- Chiến lược chia dữ liệu: StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+- Đo đối chứng nhanh trên cùng Fold 1 (80% train / 20% validation) để đánh giá
+  tác động độc lập của từng nhóm đặc trưng trước khi áp dụng cho toàn bộ 5 folds.
+- Lưu ý chống rò rỉ dữ liệu (Data Leakage): Mọi thống kê theo nhóm (mean, tần suất)
+  đều chỉ được tính trên tập huấn luyện của fold (X_tr), tuyệt đối không tính trên X_val/X_test.
+
+================================================================================
+2. BẢNG TỔNG HỢP KẾT QUẢ TRÊN FOLD 1
+================================================================================
+Thí nghiệm                                    | Số cột | best_iter | Fold 1 ROC-AUC | Chênh lệch vs Baseline (24 cột)
+----------------------------------------------|--------|-----------|----------------|--------------------------------
+Baseline (24 cột gốc thuần)                   |   24   |    373    |    0.94416     |  0.00000 (Mốc chuẩn)
+Bộ 38 cột cũ (thiết kế cho LinearSVC)         |   38   |    280    |    0.94420     | +0.00004 (Gần như không đổi)
+Nhóm A: Ratios + Risk Sums                    |   30   |    340    |    0.94424     | +0.00008 (Tăng rất nhẹ)
+Nhóm B: Group Aggregations                    |   27   |    383    |    0.94497     | +0.00081 (TĂNG MẠNH NHẤT)
+Nhóm C: Frequency Encoding                    |   29   |    384    |    0.94451     | +0.00035 (Tăng khá)
+Nhóm D: Nhóm A + Các biến nhân rủi ro         |   35   |    339    |    0.94391     | -0.00025 (GIẢM ĐIỂM)
+Kết hợp B + C                                 |   32   |    363    |    0.94494     | +0.00078 (Tương đương B)
+Kết hợp B + C + A                             |   38   |    283    |    0.94447     | +0.00031 (Tụt so với B)
+
+================================================================================
+3. PHÂN TÍCH CHI TIẾT TỪNG NHÓM (VÌ SAO TĂNG / VÌ SAO GIẢM)
+================================================================================
+
+[1] Baseline: 24 cột gốc thuần (0.94416)
+- Gồm: 13 cột số, 6 cột boolean (chuyển sang 0/1), 5 cột phân loại (chuyển sang category).
+- Nhận xét: XGBoost xử lý tốt trực tiếp trên dữ liệu gốc nhờ tree_method="hist" và
+  enable_categorical=True. Ngay cả bộ 38 cột vốn tạo cho LinearSVC (chứa log1p, sin/cos...)
+  chỉ đạt 0.94420 (+0.00004), chứng tỏ các phép biến đổi đơn điệu như log1p không giúp ích
+  cho mô hình cây (vì cây chỉ chia theo thứ tự ngưỡng, bất biến với biến đổi đơn điệu).
+
+[2] Nhóm A: Ratios + Risk Sums -> 0.94424 (+0.00008 - Tăng rất nhẹ)
+- Các cột thêm vào (6 cột):
+  + amount_to_balance_ratio = amount_usd / (account_balance_usd.clip(lower=0) + 1.0)
+  + balance_diff = account_balance_usd - amount_usd
+  + txn_intensity = txn_count_last_24h / (hours_since_last_txn.clip(lower=0) + 0.1)
+  + travel_speed_kmh = distance_from_home_km / (hours_since_last_txn.clip(lower=0) + 0.1)
+  + risk_flag_count = tổng 6 cột cờ boolean rủi ro
+  + cvv_plus_disputes = cvv_retry_count + prior_disputes
+- Giải thích kết quả:
+  + Khi đứng riêng, các tỷ lệ này giúp cây biểu diễn đường chéo (ví dụ số tiền / số dư)
+    nhanh hơn một chút (+0.00008).
+  + Tuy nhiên, khi gộp chung với các nhóm mạnh hơn (B + C + A = 0.94447), nhóm A lại kéo
+    điểm giảm xuống so với B (0.94497) và làm early stopping dừng sớm (best_iter tụt từ
+    383 xuống 283). Nguyên nhân:
+    (a) Một số tỷ lệ chứa mẫu số gần 0 (hours_since_last_txn gần 0) sinh giá trị ngoại lai lớn.
+    (b) Các biến suy diễn có độ tương quan cao với cột gốc, kết hợp với colsample_bytree=0.8
+        làm "pha loãng" xác suất cây chọn trúng các cột gốc quan trọng nhất ở mỗi lần chia nhánh.
+
+[3] Nhóm B: Group Aggregations -> 0.94497 (+0.00081 - TĂNG MẠNH NHẤT)
+- Các cột thêm vào (3 cột, thống kê tính trên X_tr mỗi fold):
+  + amount_ratio_cat = amount_usd / (mean(amount_usd theo merchant_category) + 1.0)
+  + amount_ratio_ch  = amount_usd / (mean(amount_usd theo channel) + 1.0)
+  + risk_diff_cat    = merchant_risk_score - mean(merchant_risk_score theo merchant_category)
+- Giải thích vì sao tăng mạnh:
+  + Đây là thông tin ngữ cảnh theo nhóm (context-aware feature) mà một cây quyết định đơn lẻ
+    khó tự suy ra: cùng một số tiền (ví dụ 500 USD) nhưng ở nhóm Groceries là bất thường,
+    còn ở nhóm Travel/Electronics lại bình thường.
+  + Tương tự, risk_diff_cat đo mức độ rủi ro tương đối của merchant so với mặt bằng chung
+    của chính ngành hàng đó.
+  + Chỉ thêm đúng 3 cột giàu thông tin mới (không trùng lặp với cột đơn lẻ), giúp mô hình
+    học sâu hơn (best_iter tăng lên 383) mà không gây quá khớp (overfitting).
+
+[4] Nhóm C: Frequency Encoding -> 0.94451 (+0.00035 - Tăng khá)
+- Các cột thêm vào (5 cột, tần suất xuất hiện tính trên X_tr mỗi fold):
+  + merchant_category_freq, card_type_freq, auth_method_freq, channel_freq, device_type_freq
+- Giải thích kết quả:
+  + Cung cấp độ phổ biến của từng giá trị phân loại dưới dạng biến liên tục, giúp cây dễ
+    tách các nhóm ít phổ biến/đặc thù.
+  + Tuy nhiên khi ghép chung với Nhóm B (B + C = 0.94494), điểm hầu như tương đương với
+    chỉ dùng Nhóm B (0.94497), vì thông tin phân loại theo nhóm ngành/kênh đã được Nhóm B
+    nắm bắt phần lớn.
+
+[5] Nhóm D: Nhóm A + Các biến nhân rủi ro & giờ đêm -> 0.94391 (-0.00025 - LÀM GIẢM ĐIỂM)
+- Các cột thêm vào so với Nhóm A (5 cột):
+  + amount_x_velocity     = log1p(amount_usd) * velocity_score
+  + merchant_risk_x_amount = merchant_risk_score * log1p(amount_usd)
+  + velocity_x_risk       = velocity_score * merchant_risk_score
+  + total_risk_score      = merchant_risk_score * (1 + risk_flag_count + cvv_plus_disputes)
+  + is_night              = 1 nếu time_of_day_hour < 6 hoặc >= 23, ngược lại 0
+- Giải thích vì sao giảm điểm:
+  + Các phép nhân gộp nhiều biến liên tục và rời rạc (ví dụ total_risk_score nhân 4 yếu tố)
+    làm bóp méo quan hệ gốc trong dữ liệu, tạo ra nhiều vùng giá trị nhiễu.
+  + Cây quyết định vốn đã có khả năng tự kết hợp các điều kiện qua nhiều tầng rẽ nhánh
+    (ví dụ: nếu merchant_risk_score > x VÀ velocity_score > y). Việc ép sẵn công thức nhân
+    cứng nhắc vừa dư thừa vừa làm giảm cơ hội chọn biến gốc tốt khi colsample_bytree=0.8.
+  + Khi từng thử mở rộng thêm lên 53 cột (gồm cả log_*, sin/cos thời gian và tổ hợp
+    cat_channel = 60 loại rời rạc), số lượng cột nhiễu và phân mảnh category càng lớn khiến
+    điểm nộp Kaggle giảm xuống dưới mức ban đầu.
+
+================================================================================
+4. KẾT LUẬN & CẤU HÌNH ĐƯỢC CHỌN
+================================================================================
+1. Bài học thực nghiệm về Feature Engineering cho GBDT (XGBoost):
+   - Không phải cứ thêm nhiều cột là tốt: biến đổi đơn điệu (log1p) không có tác dụng với cây;
+     các biến nhân/chia tổng hợp tự đặt dễ gây nhiễu và pha loãng colsample_bytree.
+   - Feature Engineering hiệu quả nhất cho dữ liệu bảng dạng giao dịch là Group Aggregations
+     (so sánh giao dịch hiện tại với mức trung bình của ngành hàng và kênh thanh toán),
+     được tính nghiêm ngặt trên tập train của từng fold để tránh data leakage.
+
+2. Bộ đặc trưng cuối cùng được giữ lại trong test.ipynb (27 cột = 24 gốc + 3 cột Nhóm B):
+   - Giữ nguyên 24 cột gốc (bool -> int, 5 cột chữ -> category).
+   - Bổ sung 3 cột Group Aggregations theo fold:
+     + amount_ratio_cat
+     + amount_ratio_ch
+     + risk_diff_cat
+   - Kết quả Fold 1 ROC-AUC tăng từ 0.94416 (24 cột) / 0.94420 (38 cột cũ) lên 0.94497.
+
